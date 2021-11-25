@@ -78,14 +78,21 @@ __device__ uint8_t nonce_to_str(uint64_t nonce, unsigned char* out) {
 
 
 extern __shared__ char array[];
-__global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_found_hash, int *out_found, const char* in_input_string, size_t in_input_string_size, uint8_t difficulty, uint64_t nonce_offset) {
+__global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_found_hash, int *out_found, const char* in_input_string, size_t in_input_string_size, uint8_t difficulty, uint64_t nonce_offset, const char* minid_in_input_string, size_t minid_in_input_string_size) {
 
 	// If this is the first thread of the block, init the input string in shared memory
 	char* in = (char*) &array[0];
 	if (threadIdx.x == 0) {
 		memcpy(in, in_input_string, in_input_string_size + 1);
 	}
+	
+	size_t const minArray2 = static_cast<size_t>(ceil((in_input_string_size + 1) / 8.f) * 8);
 
+
+	char* minid_in = (char*) &array[minArray2];
+	if (threadIdx.x == 0) {
+		memcpy(minid_in, minid_in_input_string, minid_in_input_string_size + 1);
+	}
 	__syncthreads(); // Ensure the input string has been written in SMEM
 
 	uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -93,7 +100,7 @@ __global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_f
 
 	// The first byte we can write because there is the input string at the begining	
 	// Respects the memory padding of 8 bit (char).
-	size_t const minArray = static_cast<size_t>(ceil((in_input_string_size + 1) / 8.f) * 8);
+	size_t const minArray = static_cast<size_t>(ceil((in_input_string_size + 1) / 8.f) * 8) + static_cast<size_t>(ceil((minid_in_input_string_size + 1) / 8.f) * 8);
 	
 	uintptr_t sha_addr = threadIdx.x * (64) + minArray;
 	uintptr_t nonce_addr = sha_addr + 32;
@@ -107,24 +114,27 @@ __global__ void sha256_kernel(char* out_input_string_nonce, unsigned char* out_f
 	assert(size <= 32);
 
 	{
-		unsigned char tmp[32];
+		// unsigned char tmp[32];
 
 		SHA256_CTX ctx;
 		sha256_init(&ctx);
-		sha256_update(&ctx, out, size);
 		sha256_update(&ctx, (unsigned char *)in, in_input_string_size);
-		sha256_final(&ctx, tmp);
+		sha256_update(&ctx, out, size);
+		sha256_update(&ctx, (unsigned char *)minid_in, minid_in_input_string_size);
+		sha256_final(&ctx, sha);
 
 		// Second round of SHA256
-		sha256_init(&ctx);
-		sha256_update(&ctx, tmp, 32);
-		sha256_final(&ctx, sha);
+		// sha256_init(&ctx);
+		// sha256_update(&ctx, tmp, 32);
+		// sha256_final(&ctx, sha);
 	}
 
 	if (checkZeroPadding(sha, difficulty) && atomicExch(out_found, 1) == 0) {
 		memcpy(out_found_hash, sha, 32);
-		memcpy(out_input_string_nonce, out, size);
-		memcpy(out_input_string_nonce + size, in, in_input_string_size + 1);		
+		memcpy(out_input_string_nonce, in, in_input_string_size);
+		memcpy(out_input_string_nonce + in_input_string_size, out, size);
+		memcpy(out_input_string_nonce + in_input_string_size + size, minid_in, minid_in_input_string_size + 1);
+		
 	}
 }
 
@@ -172,11 +182,15 @@ int main() {
 
 	t_last_updated = std::chrono::high_resolution_clock::now();
 
-	std::string in;
-	
-	std::cout << "Enter a message : ";
-	getline(std::cin, in);
+	std::string hash_of_preceding_coin;
+	std::cout << "Enter a hash_of_preceding_coin : ";
+	std::cin >> hash_of_preceding_coin;
 
+	std::string id_of_miner;
+	std::cout << "Enter a id_of_miner : ";
+	std::cin >> id_of_miner;
+
+	std::string in = std::string("CPEN 442 Coin2021") + hash_of_preceding_coin;
 
 	std::cout << "Nonce : ";
 	std::cin >> user_nonce;
@@ -187,15 +201,19 @@ int main() {
 
 
 	const size_t input_size = in.size();
+	const size_t id_of_miner_size = id_of_miner.size();
 
 	// Input string for the device
 	char *d_in = nullptr;
+	char *e_in = nullptr;
 
 	// Create the input string for the device
 	cudaMalloc(&d_in, input_size + 1);
 	cudaMemcpy(d_in, in.c_str(), input_size + 1, cudaMemcpyHostToDevice);
+	cudaMalloc(&e_in, id_of_miner_size + 1);
+	cudaMemcpy(e_in, id_of_miner.c_str(), id_of_miner_size + 1, cudaMemcpyHostToDevice);	
 
-	cudaMallocManaged(&g_out, input_size + 32 + 1);
+	cudaMallocManaged(&g_out, input_size + 32 + id_of_miner_size + 1);
 	cudaMallocManaged(&g_hash_out, 32);
 	cudaMallocManaged(&g_found, sizeof(int));
 	*g_found = 0;
@@ -210,7 +228,7 @@ int main() {
 	std::cout << "Shared memory is " << dynamic_shared_size / 1024 << "KB" << std::endl;
 
 	while (!*g_found) {
-		sha256_kernel << < NUMBLOCKS, BLOCK_SIZE, dynamic_shared_size >> > (g_out, g_hash_out, g_found, d_in, input_size, difficulty, nonce);
+		sha256_kernel << < NUMBLOCKS, BLOCK_SIZE, dynamic_shared_size >> > (g_out, g_hash_out, g_found, d_in, input_size, difficulty, nonce, e_in, id_of_miner_size);
 
 		cudaError_t err = cudaDeviceSynchronize();
 		if (err != cudaSuccess) {
